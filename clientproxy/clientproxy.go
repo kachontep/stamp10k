@@ -7,13 +7,15 @@ import (
 	"math/rand"
 	"net/http"
 	"os"
+	"os/signal"
+	"syscall"
 	"time"
 
 	"github.com/confluentinc/confluent-kafka-go/kafka"
 	"github.com/kachontep/stamp10k/schema"
 )
 
-var reqQueue = make(chan *schema.BookingRequest)
+var reqQueue = make(chan *schema.BookingRequest, 10000)
 var reqMap = make(map[string]*synchronousBookingRequest)
 
 func main() {
@@ -22,59 +24,40 @@ func main() {
 			os.Args[0])
 		os.Exit(1)
 	}
+
 	broker := os.Args[1]
 	requestTopic := os.Args[2]
 	responseTopic := os.Args[3]
 	group := os.Args[4]
-	producerService(broker, requestTopic, reqQueue)
-	consumerService(broker, responseTopic, group, reqMap)
+
+	proxyService(broker, requestTopic, responseTopic, group, reqQueue, reqMap)
 	httpService()
 }
 
-func consumerService(broker, topic, group string, requestMap map[string]*synchronousBookingRequest) {
-	c, err := kafka.NewConsumer(&kafka.ConfigMap{
-		"bootstrap.servers":               broker,
-		"group.id":                        group,
-		"session.timeout.ms":              6000,
-		"go.events.channel.enable":        true,
-		"go.application.rebalance.enable": false,
-		// Enable generation of PartitionEOF when the
-		// end of a partition is reached.
-		"enable.partition.eof": false,
-		"auto.offset.reset":    "earliest",
-	})
+func proxyService(broker, requestTopic, responseTopic, group string,
+	requestChannel <-chan *schema.BookingRequest, requestMap map[string]*synchronousBookingRequest) {
 
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "Failed to create consumer: %s\n", err)
-		os.Exit(1)
-	}
+	producerClosed := make(chan bool, 1)
+	consumerClosed := make(chan bool, 1)
 
-	fmt.Printf("Created Consumer %v\n", c)
+	sigs := make(chan os.Signal, 1)
+	signal.Notify(sigs, syscall.SIGINT, syscall.SIGTERM)
 
-	err = c.SubscribeTopics([]string{topic}, nil)
+	producerDone := producerService(broker, requestTopic, reqQueue, producerClosed)
+	consumerDone := consumerService(broker, responseTopic, group, reqMap, consumerClosed)
 
 	go func() {
-		run := true
-		for run == true {
-			select {
-			case ev := <-c.Events():
-				switch e := ev.(type) {
-				case *kafka.Message:
-					fmt.Printf("%% Message on %s:\n%s\n", e.TopicPartition, string(e.Value))
-					processBookingResponse(e, requestMap)
-				case kafka.Error:
-					// Errors should generally be considered as informational, the client will try to automatically recover
-					fmt.Fprintf(os.Stderr, "%% Error: %v\n", e)
-				}
-			}
-		}
-		fmt.Printf("Closing consumer\n")
-		c.Close()
+		<-sigs
+		producerClosed <- true
+		<-producerDone
+		consumerClosed <- true
+		<-consumerDone
+		os.Exit(0)
 	}()
 }
 
-func producerService(broker, topic string, requestChannel <-chan *schema.BookingRequest) {
-	p, err := kafka.NewProducer(&kafka.ConfigMap{"boostrap.servers": broker})
+func producerService(broker, topic string, requestChannel <-chan *schema.BookingRequest, closed <-chan bool) (done chan bool) {
+	p, err := kafka.NewProducer(&kafka.ConfigMap{"bootstrap.servers": broker})
 
 	if err != nil {
 		fmt.Printf("Failed to create producer: %s\n", err)
@@ -102,23 +85,90 @@ func producerService(broker, topic string, requestChannel <-chan *schema.Booking
 		}
 	}()
 
-	// Process waiting message in request queue
+	// Send waiting message in request queue
+	done = make(chan bool, 1)
 	go func() {
-		for reqMsg := range requestChannel {
-			value, err := json.Marshal(reqMsg)
-			if err != nil {
-				fmt.Printf("Error marshalng message %v\n", reqMsg)
-				continue
-			}
-			p.ProduceChannel() <- &kafka.Message{
-				TopicPartition: kafka.TopicPartition{
-					Topic:     &topic,
-					Partition: kafka.PartitionAny,
-				},
-				Value: value,
+		run := true
+		for run {
+			select {
+			case <-closed:
+				fmt.Printf("Receive signal to close producer\n")
+				run = false
+			case reqMsg := <-requestChannel:
+				fmt.Printf("Sending a message %v\n", reqMsg)
+				value, err := json.Marshal(reqMsg)
+				if err != nil {
+					fmt.Printf("Error marshalng message\n", reqMsg)
+					continue
+				}
+				p.ProduceChannel() <- &kafka.Message{
+					TopicPartition: kafka.TopicPartition{
+						Topic:     &topic,
+						Partition: kafka.PartitionAny,
+					},
+					Value: value,
+				}
 			}
 		}
+		fmt.Printf("Closing producer\n")
+		p.Close()
+		done <- true
 	}()
+	return
+}
+
+func consumerService(broker, topic, group string, requestMap map[string]*synchronousBookingRequest, closed chan bool) (done chan bool) {
+	c, err := kafka.NewConsumer(&kafka.ConfigMap{
+		"bootstrap.servers":               broker,
+		"group.id":                        group,
+		"session.timeout.ms":              6000,
+		"go.events.channel.enable":        true,
+		"go.application.rebalance.enable": false,
+		// Enable generation of PartitionEOF when the
+		// end of a partition is reached.
+		"enable.partition.eof": false,
+		"auto.offset.reset":    "earliest",
+	})
+
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Failed to create consumer: %s\n", err)
+		os.Exit(1)
+	}
+
+	fmt.Printf("Created Consumer %v\n", c)
+
+	err = c.SubscribeTopics([]string{topic}, nil)
+
+	if err != nil {
+		fmt.Printf("Failed to create consumer: %s\n", err)
+		os.Exit(1)
+	}
+
+	// Receive booking response and process
+	done = make(chan bool, 1)
+	go func() {
+		run := true
+		for run == true {
+			select {
+			case <-closed:
+				fmt.Printf("Receive signal to close consumer\n")
+				run = false
+			case ev := <-c.Events():
+				switch e := ev.(type) {
+				case *kafka.Message:
+					fmt.Printf("%% Message on %s:\n%s\n", e.TopicPartition, string(e.Value))
+					processBookingResponse(e, requestMap)
+				case kafka.Error:
+					// Errors should generally be considered as informational, the client will try to automatically recover
+					fmt.Fprintf(os.Stderr, "%% Error: %v\n", e)
+				}
+			}
+		}
+		fmt.Printf("Closing consumer\n")
+		c.Close()
+		done <- true
+	}()
+	return
 }
 
 func processBookingResponse(e *kafka.Message, requestMap map[string]*synchronousBookingRequest) {
@@ -166,8 +216,8 @@ func submitBooking(w http.ResponseWriter, r *http.Request) {
 	sr := newSyncBookingRequest(&b)
 
 	// Wait for reply and reply to client
-
-	// Hard limit timeout - this should be more than system regulator's timeout.
+	// Hard limit timeout - this should be more than global
+	// system timeout
 	timeout := time.NewTimer(5 * time.Second)
 
 	select {
@@ -186,7 +236,7 @@ func submitBooking(w http.ResponseWriter, r *http.Request) {
 	case <-timeout.C:
 		w.WriteHeader(http.StatusGatewayTimeout)
 		json.NewEncoder(w).Encode(map[string]string{
-			"error": "Internal server processing timed out",
+			"error": "Processing request timed out",
 		})
 	}
 }
