@@ -135,12 +135,12 @@ func consumerService(broker, topic, group string, requestMap map[string]*synchro
 		os.Exit(1)
 	}
 
-	fmt.Printf("Created Consumer %v\n", c)
+	fmt.Printf("Create Consumer %v\n", c)
 
 	err = c.SubscribeTopics([]string{topic}, nil)
 
 	if err != nil {
-		fmt.Printf("Failed to create consumer: %s\n", err)
+		fmt.Printf("Failed to subscribe consumer: %s\n", err)
 		os.Exit(1)
 	}
 
@@ -156,7 +156,7 @@ func consumerService(broker, topic, group string, requestMap map[string]*synchro
 			case ev := <-c.Events():
 				switch e := ev.(type) {
 				case *kafka.Message:
-					fmt.Printf("%% Message on %s:\n%s\n", e.TopicPartition, string(e.Value))
+					// fmt.Printf("%% Message on %s:\n%s\n", e.TopicPartition, string(e.Value))
 					processBookingResponse(e, requestMap)
 				case kafka.Error:
 					// Errors should generally be considered as informational, the client will try to automatically recover
@@ -216,10 +216,7 @@ func submitBooking(w http.ResponseWriter, r *http.Request) {
 	sr := newSyncBookingRequest(&b)
 
 	// Wait for reply and reply to client
-	// Hard limit timeout - this should be more than global
-	// system timeout
-	timeout := time.NewTimer(5 * time.Second)
-
+	timeout := time.NewTimer(5 * time.Second) // Should be greater than global timeout
 	select {
 	case m := <-sr.C:
 		if m.Error != "" {
@@ -239,6 +236,9 @@ func submitBooking(w http.ResponseWriter, r *http.Request) {
 			"error": "Processing request timed out",
 		})
 	}
+
+	// Clear request from request mapping
+	delete(reqMap, sr.msg.RequestID)
 }
 
 func checkStamps(w http.ResponseWriter, r *http.Request) {
